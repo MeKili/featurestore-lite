@@ -134,6 +134,51 @@ def test_reference_validation() -> None:
         store.get_online_features(["c1"], ["ghost:x"])
 
 
+def test_historical_join_issues_one_query_per_view_not_per_row() -> None:
+    store = make_store()
+    rows = [{"entity_id": "c1", "event_ts": ts} for ts in range(0, 400, 7)]
+    assert len(rows) > 50
+
+    statements: list[str] = []
+    store._db.set_trace_callback(statements.append)
+    try:
+        store.get_historical_features(rows, REFS)
+    finally:
+        store._db.set_trace_callback(None)
+
+    joins = [s for s in statements if "WITH requested" in s]
+    # REFS both belong to the "stats" view, so the whole batch costs one join, not one per row.
+    assert len(joins) == 1
+
+
+def test_bulk_historical_join_matches_row_by_row_join_across_chunk_boundaries() -> None:
+    store = FeatureStore()
+    store.register(FeatureView("stats", "customer", {"orders": FeatureType.INT}, ttl_seconds=90))
+    entities = [f"c{i}" for i in range(5)]
+    store.ingest(
+        "stats",
+        [
+            {"entity_id": entity, "event_ts": float(ts), "orders": ts}
+            for entity in entities
+            for ts in range(0, 1000, 10)
+        ],
+    )
+    # More rows than one bulk chunk, so the join must stitch results back together correctly.
+    requested = [
+        {"entity_id": entities[i % len(entities)], "event_ts": float(i * 3)} for i in range(1300)
+    ]
+
+    bulk = store.get_historical_features(requested, ["stats:orders"])
+    for i, row in enumerate(bulk):
+        expected = store.get_historical_features([requested[i]], ["stats:orders"])[0]
+        assert row["stats:orders"] == expected["stats:orders"], i
+
+
+def test_historical_join_handles_empty_input() -> None:
+    store = make_store()
+    assert store.get_historical_features([], REFS) == []
+
+
 def test_persistence_across_connections(tmp_path: Path) -> None:
     path = str(tmp_path / "fs.db")
     first = FeatureStore(path)

@@ -104,10 +104,15 @@ Set `FEATURESTORE_DB` to a file path to persist data between restarts.
   early, because discovering a type mix-up during training is far more expensive.
 - **Each row carries all of a view's features.** That keeps "latest row" well defined. Features
   that update at different rates belong in different views.
-- **Limitations.** The point-in-time join issues one indexed query per training row, which is fine
-  for thousands of rows but not for billions. A production system would do this as a bulk as-of
-  join in a warehouse or dataframe engine. There is no late-arriving-data handling, access
-  control, or streaming ingestion, and SQLite means a single writer.
+- **The historical join runs in bulk.** `get_historical_features` issues one query per referenced
+  view per 500 requested rows, not one query per row: the requested `(entity_id, event_ts)` pairs
+  are passed in as a `VALUES` table and joined against the offline history through a correlated
+  subquery that the `offline_lookup` index turns into an indexed lookup per row, so a training set
+  of thousands of rows costs a handful of round trips instead of thousands.
+- **Limitations.** The bulk join still issues one query per view per chunk, so it does not batch
+  across views, and for billions of rows a production system would still want this done as a
+  dataframe or warehouse as-of merge instead of SQLite. There is no late-arriving-data handling,
+  access control, or streaming ingestion, and SQLite means a single writer.
 
 ## Tests
 

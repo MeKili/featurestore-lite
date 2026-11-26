@@ -13,6 +13,10 @@ from featurestore.schema import FeatureView, to_epoch
 
 Timestamp = datetime | str | float | int
 
+# SQLite's default SQLITE_MAX_VARIABLE_NUMBER is comfortably above this, and keeping each
+# query to a few hundred rows avoids ever bumping into it on an unusual build.
+_BULK_CHUNK_SIZE = 500
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS views (name TEXT PRIMARY KEY, definition TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS offline (
@@ -108,25 +112,54 @@ class FeatureStore:
         For every ``{"entity_id", "event_ts"}`` row, each feature is the most recent value known
         at or before ``event_ts``. Values from the future are never used, and values older than the
         view's TTL come back as ``None``. This is what prevents label leakage.
+
+        The join runs as a bulk as-of join: each referenced view costs one query per
+        ``_BULK_CHUNK_SIZE`` rows of ``entity_rows``, rather than one query per row.
         """
         views = self._validated(refs)
         wanted = self._split_refs(refs)
-        out: list[dict[str, Any]] = []
-        for entity_row in entity_rows:
-            entity_id, as_of = str(entity_row["entity_id"]), to_epoch(entity_row["event_ts"])
-            result: dict[str, Any] = {"entity_id": entity_id, "event_ts": as_of}
-            for view_name, features in wanted.items():
-                row = self._db.execute(
-                    "SELECT event_ts, payload FROM offline WHERE view = ? AND entity_id = ? "
-                    "AND event_ts <= ? ORDER BY event_ts DESC LIMIT 1",
-                    (view_name, entity_id, as_of),
-                ).fetchone()
-                usable = row is not None and self._fresh(views[view_name], row[0], as_of)
-                payload = json.loads(row[1]) if usable else {}
-                for feature in features:
-                    result[f"{view_name}:{feature}"] = payload.get(feature)
-            out.append(result)
+        requested = [(str(row["entity_id"]), to_epoch(row["event_ts"])) for row in entity_rows]
+        out: list[dict[str, Any]] = [
+            {"entity_id": entity_id, "event_ts": as_of} for entity_id, as_of in requested
+        ]
+        for view_name, features in wanted.items():
+            for start in range(0, len(requested), _BULK_CHUNK_SIZE):
+                chunk = requested[start : start + _BULK_CHUNK_SIZE]
+                for offset, (event_ts, payload) in self._as_of_join(view_name, chunk):
+                    idx = start + offset
+                    as_of = requested[idx][1]
+                    usable = event_ts is not None and self._fresh(views[view_name], event_ts, as_of)
+                    values = json.loads(payload) if usable and payload is not None else {}
+                    for feature in features:
+                        out[idx][f"{view_name}:{feature}"] = values.get(feature)
         return out
+
+    def _as_of_join(
+        self, view_name: str, chunk: Sequence[tuple[str, float]]
+    ) -> list[tuple[int, tuple[float | None, str | None]]]:
+        """For each ``(entity_id, as_of)`` in ``chunk``, the latest offline row at or before it.
+
+        One query per call, built as a ``VALUES`` table joined against ``offline`` through a
+        correlated subquery that the ``offline_lookup`` index turns into an indexed lookup per
+        requested row, so a whole batch costs one round trip instead of one per row.
+        """
+        if not chunk:
+            return []
+        values_sql = ", ".join("(?, ?, ?)" for _ in chunk)
+        params: list[Any] = []
+        for offset, (entity_id, as_of) in enumerate(chunk):
+            params.extend((offset, entity_id, as_of))
+        params.append(view_name)
+        rows = self._db.execute(
+            f"WITH requested(idx, entity_id, as_of) AS (VALUES {values_sql}) "
+            "SELECT requested.idx, offline.event_ts, offline.payload FROM requested "
+            "LEFT JOIN offline ON offline.rowid = ("
+            "  SELECT o.rowid FROM offline o WHERE o.view = ? AND o.entity_id = requested.entity_id"
+            "  AND o.event_ts <= requested.as_of ORDER BY o.event_ts DESC LIMIT 1"
+            ")",
+            params,
+        ).fetchall()
+        return [(idx, (event_ts, payload)) for idx, event_ts, payload in rows]
 
     # ------------------------------------------------------------------ online
     def materialize(self, view_name: str, as_of: Timestamp | None = None) -> int:
